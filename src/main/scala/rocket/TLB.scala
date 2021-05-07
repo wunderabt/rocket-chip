@@ -19,6 +19,17 @@ import chisel3.internal.sourceinfo.SourceInfo
 case object PgLevels extends Field[Int](2)
 case object ASIdBits extends Field[Int](0)
 
+/**
+  * rs1 rs2
+  *  0   0 -> flush All
+  *  0   1 -> flush by ASID
+  *  1   1 -> flush by ADDR
+  *  1   0 -> flush by ADDR and ASID
+  * If rs1=x0 and rs2=x0, the fence orders all reads and writes made to any level of the page tables, for all address spaces.
+  * If rs1=x0 and rs2̸!=x0, the fence orders all reads and writes made to any level of the page tables, but only for the address space identified by integer register rs2. Accesses to global mappings (see Section 4.3.1) are not ordered.
+  * If rs1̸!=x0 and rs2=x0, the fence orders only reads and writes made to the leaf page table entry corresponding to the virtual address in rs1, for all address spaces.
+  * If rs1̸!=x0 and rs2̸!=x0, the fence orders only reads and writes made to the leaf page table entry corresponding to the virtual address in rs1, for the address space identified by integer register rs2. Accesses to global mappings are not ordered.
+  */
 class SFenceReq(implicit p: Parameters) extends CoreBundle()(p) {
   val rs1 = Bool()
   val rs2 = Bool()
@@ -27,9 +38,13 @@ class SFenceReq(implicit p: Parameters) extends CoreBundle()(p) {
 }
 
 class TLBReq(lgMaxSize: Int)(implicit p: Parameters) extends CoreBundle()(p) {
+  /** request address from CPU. */
   val vaddr = UInt(width = vaddrBitsExtended)
+  /** don't lookup TLB, bypass vaddr as paddr. */
   val passthrough = Bool()
+  /** @todo seems granularity */
   val size = UInt(width = log2Ceil(lgMaxSize + 1))
+  /** memory command. */
   val cmd  = Bits(width = M_SZ)
 
   override def cloneType = new TLBReq(lgMaxSize).asInstanceOf[this.type]
@@ -43,27 +58,49 @@ class TLBExceptions extends Bundle {
 
 class TLBResp(implicit p: Parameters) extends CoreBundle()(p) {
   // lookup responses
+  /** @todo */
   val miss = Bool()
+  /** physical address. */
   val paddr = UInt(width = paddrBits)
+  /** page fault exception. */
   val pf = new TLBExceptions
+  /** access exception. */
   val ae = new TLBExceptions
+  /** misaligned access exception. */
   val ma = new TLBExceptions
+  /** @todo */
   val cacheable = Bool()
+  /** @todo */
   val must_alloc = Bool()
+  /** @todo */
   val prefetchable = Bool()
 }
 
 class TLBEntryData(implicit p: Parameters) extends CoreBundle()(p) {
   val ppn = UInt(width = ppnBits)
+  /** pte.u user */
   val u = Bool()
+  /** pte.g global */
   val g = Bool()
+
+  /** access exception.
+    * @todo WTF ae here?
+    */
   val ae = Bool()
+
+  /** supervisor write */
   val sw = Bool()
+  /** supervisor execute */
   val sx = Bool()
+  /** supervisor read */
   val sr = Bool()
+  /** prot_w */
   val pw = Bool()
+  /** prot_x */
   val px = Bool()
+  /** prot_r */
   val pr = Bool()
+
   val ppp = Bool() // PutPartial
   val pal = Bool() // AMO logical
   val paa = Bool() // AMO arithmetic
@@ -149,25 +186,56 @@ case class TLBConfig(
     nSectors: Int = 4,
     nSuperpageEntries: Int = 4)
 
+/** MMU Block which can be used as PMA & TLB
+  * @todo PMA -> consume diplomacy parameter generate physical memory address checking logic.
+  * Boom use Rocket ITLB, and its own DTLB.
+  * Accelerators:
+  *   sha3: DTLB
+  *   gemmini: DTLB
+  *   hwacha: DTLB*2+ITLB
+  *
+  * @param instruction true for ITLB, false for DTLB
+  * @param lgMaxSize @todo seems granularity
+  * @param cfg [[TLBConfig]]
+  * @param edge collect SoC metadata.
+  */
 class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(p) {
   val io = new Bundle {
+    /** request from CPU. */
     val req = Decoupled(new TLBReq(lgMaxSize)).flip
+    /** response to CPU. */
     val resp = new TLBResp().asOutput
+    /** SFence Input. */
     val sfence = Valid(new SFenceReq).asInput
+    /** IO to PTW. */
     val ptw = new TLBPTWIO
-    val kill = Bool(INPUT) // suppress a TLB refill, one cycle after a miss
+    /** suppress a TLB refill, one cycle after a miss. */
+    val kill = Bool(INPUT)
   }
 
+  /** @todo WTF pmpGranularity? seems a bug here. */
   val pageGranularityPMPs = pmpGranularity >= (1 << pgIdxBits)
+  /** virtual memory. */
   val vpn = io.req.bits.vaddr(vaddrBits-1, pgIdxBits)
   val memIdx = vpn.extract(cfg.nSectors.log2 + cfg.nSets.log2 - 1, cfg.nSectors.log2)
+
+  /** TLB Entry */
   val sectored_entries = Reg(Vec(cfg.nSets, Vec(cfg.nWays / cfg.nSectors, new TLBEntry(cfg.nSectors, false, false))))
+  /** Superpage Entry */
   val superpage_entries = Reg(Vec(cfg.nSuperpageEntries, new TLBEntry(1, true, true)))
+  /** Special Entry
+    * If PMP granularity is less than page size, thus need additional "special" entry manage PMP.
+    */
   val special_entry = (!pageGranularityPMPs).option(Reg(new TLBEntry(1, true, false)))
+
+  /** @todo */
   def ordinary_entries = sectored_entries(memIdx) ++ superpage_entries
+  /** @todo */
   def all_entries = ordinary_entries ++ special_entry
+  /** @todo */
   def all_real_entries = sectored_entries.flatten ++ superpage_entries ++ special_entry
 
+  /** State Machine */
   val s_ready :: s_request :: s_wait :: s_wait_invalidate :: Nil = Enum(UInt(), 4)
   val state = Reg(init=s_ready)
   val r_refill_tag = Reg(UInt(width = vpnBits))
@@ -176,6 +244,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val r_sectored_hit_addr = Reg(UInt(log2Ceil(sectored_entries(0).size).W))
   val r_sectored_hit = Reg(Bool())
 
+  /** privilege mode */
   val priv = if (instruction) io.ptw.status.prv else io.ptw.status.dprv
   val priv_s = priv(0)
   val priv_uses_vm = priv <= PRV.S
