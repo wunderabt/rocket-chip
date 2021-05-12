@@ -3,11 +3,14 @@
 package freechips.rocketchip.rocket
 
 import Chisel._
-import scala.collection.mutable.{ArrayBuffer, Map}
+import chisel3.util.experimental.decode._
+
+import scala.collection.mutable.ArrayBuffer
 
 object DecodeLogic
 {
-	def apply(addr: UInt, default: BitPat, mapping: Iterable[(BitPat, BitPat)]): UInt = {???}
+	def apply(addr: UInt, default: BitPat, mapping: Iterable[(BitPat, BitPat)]): UInt =
+    chisel3.util.experimental.decode.decoder(QMCMinimizer, addr, TruthTable(mapping.toMap, default))
   def apply(addr: UInt, default: Seq[BitPat], mappingIn: Iterable[(BitPat, Seq[BitPat])]): Seq[UInt] = {
     val mapping = ArrayBuffer.fill(default.size)(ArrayBuffer[(BitPat, BitPat)]())
     for ((key, values) <- mappingIn)
